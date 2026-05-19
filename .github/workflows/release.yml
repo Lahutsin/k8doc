@@ -59,6 +59,10 @@ jobs:
             BUILD_DIR="dist/${ARCHIVE_NAME}"
             mkdir -p "$BUILD_DIR"
             CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags='-s -w' -o "$BUILD_DIR/$BIN_NAME" ./cmd/k8doc
+            cp "$BUILD_DIR/$BIN_NAME" "dist/${ARCHIVE_NAME}.${BIN_NAME##*.}"
+            if [ "$BIN_NAME" = "k8doc" ]; then
+              mv "dist/${ARCHIVE_NAME}.k8doc" "dist/${ARCHIVE_NAME}"
+            fi
             cp README.md LICENSE "$BUILD_DIR/"
 
             if [ "$GOOS" = "windows" ]; then
@@ -73,7 +77,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          shasum -a 256 *.tar.gz *.zip > checksums.txt
+          shasum -a 256 * > checksums.txt
 
       - name: Upload release bundle artifact
         uses: actions/upload-artifact@v4
@@ -90,19 +94,12 @@ jobs:
           name: release-bundles-${{ github.ref_name }}
           path: dist
 
-      - name: Publish GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ github.ref_name }}
-        run: |
-          prerelease_args=""
-          case "$VERSION" in
-            *-alpha*|*-beta*|*-rc*)
-              prerelease_args="--prerelease"
-              ;;
-          esac
-
-          gh release create "$VERSION" dist/* \
-            --generate-notes \
-            --title "$VERSION" \
-            $prerelease_args
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          files: |
+            dist/*
