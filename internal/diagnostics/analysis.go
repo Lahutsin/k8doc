@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -104,6 +106,31 @@ type FocusSpec struct {
 	Kind  string `json:"kind,omitempty"`
 	Value string `json:"value,omitempty"`
 }
+
+type kubernetesVersion struct {
+	Major int
+	Minor int
+	Raw   string
+}
+
+type removedAPI struct {
+	Group      string
+	Version    string
+	Resource   string
+	RemovedIn  kubernetesVersion
+	Successor  string
+	Note       string
+}
+
+type deprecatedAPIRef struct {
+	Group    string
+	Version  string
+	Resource string
+}
+
+var kubernetesVersionPattern = regexp.MustCompile(`^v?(\d+)\.(\d+)`)
+var deprecatedAPIMetricPattern = regexp.MustCompile(`group="([^"]+)",version="([^"]+)",resource="([^"]+)"`)
+var deprecatedAPISummaryPattern = regexp.MustCompile(`([a-z0-9.-]+)/((?:v\d+(?:alpha\d+|beta\d+)?))`)
 
 type RuleFile struct {
 	Rules []Rule `json:"rules" yaml:"rules"`
@@ -406,8 +433,11 @@ func BuildStoragePaths(ctx context.Context, cs *kubernetes.Clientset, namespace 
 	return paths, nil
 }
 
-func EvaluateUpgradeReadiness(ctx context.Context, cs *kubernetes.Clientset, namespace string, issues []Issue) ([]Advisory, error) {
+func EvaluateUpgradeReadiness(ctx context.Context, cs *kubernetes.Clientset, namespace string, issues []Issue, targetVersion string) ([]Advisory, error) {
 	advisories := make([]Advisory, 0)
+	if targetVersion != "" {
+		advisories = append(advisories, upgradeVersionAdvisories(ctx, cs, issues, targetVersion)...)
+	}
 	criticalPDB := countIssuesByCheckPrefix(issues, "pdb-")
 	if criticalPDB > 0 {
 		advisories = append(advisories, Advisory{Title: "Pod Disruption Budgets", Severity: SeverityWarning, Summary: fmt.Sprintf("%d PDB findings may block node drains or upgrades", criticalPDB), Recommendation: "Review disruptionsAllowed, selector overlap, and expected pod counts before upgrading nodes."})
@@ -439,6 +469,177 @@ func EvaluateUpgradeReadiness(ctx context.Context, cs *kubernetes.Clientset, nam
 	}
 	sortAdvisories(advisories)
 	return advisories, nil
+}
+
+func NormalizeTargetKubernetesVersion(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	version, err := parseKubernetesVersion(value)
+	if err != nil {
+		return "", err
+	}
+	return version.Raw, nil
+}
+
+func parseKubernetesVersion(value string) (kubernetesVersion, error) {
+	value = strings.TrimSpace(value)
+	match := kubernetesVersionPattern.FindStringSubmatch(value)
+	if len(match) != 3 {
+		return kubernetesVersion{}, fmt.Errorf("expected version like v1.31 or 1.31.2, got %q", value)
+	}
+	major, err := strconv.Atoi(match[1])
+	if err != nil {
+		return kubernetesVersion{}, fmt.Errorf("parse major version: %w", err)
+	}
+	minor, err := strconv.Atoi(match[2])
+	if err != nil {
+		return kubernetesVersion{}, fmt.Errorf("parse minor version: %w", err)
+	}
+	return kubernetesVersion{Major: major, Minor: minor, Raw: fmt.Sprintf("v%d.%d", major, minor)}, nil
+}
+
+func upgradeVersionAdvisories(ctx context.Context, cs *kubernetes.Clientset, issues []Issue, targetVersion string) []Advisory {
+	advisories := make([]Advisory, 0)
+	target, err := parseKubernetesVersion(targetVersion)
+	if err != nil {
+		return advisories
+	}
+	blockedDeprecated := deprecatedAPIRemovalBlockers(issues, target)
+	if len(blockedDeprecated) > 0 {
+		examples := make([]string, 0, len(blockedDeprecated))
+		for _, blocker := range blockedDeprecated {
+			examples = append(examples, fmt.Sprintf("%s/%s %s", blocker.Group, blocker.Version, blocker.Resource))
+		}
+		sort.Strings(examples)
+		if len(examples) > 3 {
+			examples = examples[:3]
+		}
+		advisories = append(advisories, Advisory{
+			Title:          "Removed APIs In Target Version",
+			Severity:       SeverityCritical,
+			Summary:        fmt.Sprintf("%d deprecated API findings are removed by %s, including %s", len(blockedDeprecated), target.Raw, strings.Join(examples, ", ")),
+			Recommendation: buildRemovedAPIRecommendation(blockedDeprecated, target),
+		})
+	}
+	if deprecatedCount := countUpgradeDeprecatedAPIIssues(issues); deprecatedCount > 0 && len(blockedDeprecated) == 0 {
+		advisories = append(advisories, Advisory{
+			Title:          "Deprecated APIs For Target Version",
+			Severity:       SeverityCritical,
+			Summary:        fmt.Sprintf("%d deprecated API findings must be cleared before upgrading to %s", deprecatedCount, target.Raw),
+			Recommendation: fmt.Sprintf("Remove deprecated API consumers before the cluster reaches %s so the upgrade is not blocked by removed endpoints.", target.Raw),
+		})
+	}
+	if cs == nil {
+		return advisories
+	}
+	serverVersion, err := cs.Discovery().ServerVersion()
+	if err != nil {
+		return advisories
+	}
+	current, err := parseKubernetesVersion(serverVersion.GitVersion)
+	if err != nil {
+		return advisories
+	}
+	severity := SeverityInfo
+	recommendation := "Validate add-ons, admission webhooks, API removals, and node drain behavior before upgrading."
+	switch {
+	case target.Major < current.Major || (target.Major == current.Major && target.Minor <= current.Minor):
+		recommendation = "Target version is not newer than the current cluster version; use a higher target when validating a future upgrade."
+	case target.Major > current.Major || target.Minor > current.Minor+1:
+		severity = SeverityWarning
+		recommendation = "Kubernetes upgrades should usually advance one minor version at a time. Plan sequential control-plane and node upgrades instead of skipping minors."
+	default:
+		recommendation = fmt.Sprintf("Planned upgrade path from %s to %s stays within the usual one-minor-step model.", current.Raw, target.Raw)
+	}
+	advisories = append(advisories, Advisory{
+		Title:          "Cluster Version Path",
+		Severity:       severity,
+		Summary:        fmt.Sprintf("current cluster version %s compared with target %s", current.Raw, target.Raw),
+		Recommendation: recommendation,
+	})
+	return advisories
+}
+
+func deprecatedAPIRemovalBlockers(issues []Issue, target kubernetesVersion) []removedAPI {
+	blockers := make([]removedAPI, 0)
+	seen := map[string]struct{}{}
+	for _, issue := range issues {
+		ref, ok := parseDeprecatedAPIRef(issue)
+		if !ok {
+			continue
+		}
+		for _, candidate := range removedAPIMatrix {
+			if !matchesRemovedAPI(ref, candidate) {
+				continue
+			}
+			if !kubernetesVersionAtOrAfter(target, candidate.RemovedIn) {
+				continue
+			}
+			key := candidate.Group + "/" + candidate.Version + "/" + candidate.Resource
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			blockers = append(blockers, candidate)
+		}
+	}
+	return blockers
+}
+
+func parseDeprecatedAPIRef(issue Issue) (deprecatedAPIRef, bool) {
+	summary := strings.TrimSpace(issue.Summary)
+	if matches := deprecatedAPIMetricPattern.FindStringSubmatch(summary); len(matches) == 4 {
+		return deprecatedAPIRef{Group: matches[1], Version: matches[2], Resource: matches[3]}, true
+	}
+	if matches := deprecatedAPISummaryPattern.FindStringSubmatch(summary); len(matches) == 3 {
+		return deprecatedAPIRef{Group: matches[1], Version: matches[2]}, true
+	}
+	return deprecatedAPIRef{}, false
+}
+
+func matchesRemovedAPI(ref deprecatedAPIRef, candidate removedAPI) bool {
+	if ref.Group != candidate.Group || ref.Version != candidate.Version {
+		return false
+	}
+	return ref.Resource == "" || ref.Resource == candidate.Resource
+}
+
+func kubernetesVersionAtOrAfter(current, target kubernetesVersion) bool {
+	if current.Major != target.Major {
+		return current.Major > target.Major
+	}
+	return current.Minor >= target.Minor
+}
+
+func buildRemovedAPIRecommendation(blockers []removedAPI, target kubernetesVersion) string {
+	if len(blockers) == 0 {
+		return fmt.Sprintf("Migrate workloads and manifests off the removed APIs before upgrading to %s.", target.Raw)
+	}
+	hints := make([]string, 0, len(blockers))
+	for _, blocker := range blockers {
+		hint := fmt.Sprintf("%s/%s %s -> %s", blocker.Group, blocker.Version, blocker.Resource, blocker.Successor)
+		if blocker.Note != "" {
+			hint += fmt.Sprintf(" (%s)", blocker.Note)
+		}
+		hints = append(hints, hint)
+	}
+	sort.Strings(hints)
+	if len(hints) > 3 {
+		hints = hints[:3]
+	}
+	return fmt.Sprintf("Migrate workloads and manifests before upgrading to %s. Suggested paths: %s.", target.Raw, strings.Join(hints, "; "))
+}
+
+func countUpgradeDeprecatedAPIIssues(issues []Issue) int {
+	count := 0
+	for _, issue := range issues {
+		if issue.Check == "deprecated-apis" || strings.Contains(issue.Check, "deprecated-api") || strings.Contains(strings.ToLower(issue.Summary), "deprecated api") {
+			count++
+		}
+	}
+	return count
 }
 
 func EvaluateSecurityPosture(ctx context.Context, cs *kubernetes.Clientset, namespace string, issues []Issue) ([]Advisory, error) {

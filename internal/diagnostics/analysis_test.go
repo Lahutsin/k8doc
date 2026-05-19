@@ -226,6 +226,12 @@ func TestAnalysisComparisonsAndReadinessHelpers(t *testing.T) {
 	if len(readiness) < 3 || readiness[0].Severity != SeverityCritical {
 		t.Fatalf("unexpected readiness advisories: %+v", readiness)
 	}
+	if normalized, err := NormalizeTargetKubernetesVersion(" 1.31.4 "); err != nil || normalized != "v1.31" {
+		t.Fatalf("unexpected normalized target version: %q err=%v", normalized, err)
+	}
+	if _, err := NormalizeTargetKubernetesVersion("broken"); err == nil {
+		t.Fatal("expected invalid target version to fail normalization")
+	}
 
 	if EvaluatePDBUpgradeImpact([]policyv1.PodDisruptionBudget{{Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: 0, ExpectedPods: 3}}}) != 1 {
 		t.Fatal("expected one blocked pdb")
@@ -245,6 +251,150 @@ func TestAnalysisComparisonsAndReadinessHelpers(t *testing.T) {
 	sortAdvisories(advisories)
 	if advisories[0].Title != "alpha" {
 		t.Fatalf("unexpected advisory order: %+v", advisories)
+	}
+}
+
+func TestEvaluateUpgradeReadinessWithTargetVersion(t *testing.T) {
+	ctx := context.Background()
+	cs := newHTTPBackedClientset(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/version":
+			writeJSONResponse(t, w, http.StatusOK, map[string]any{"major": "1", "minor": "29", "gitVersion": "v1.29.3"})
+		case "/apis/apps/v1/deployments":
+			writeJSONResponse(t, w, http.StatusOK, &appsv1.DeploymentList{Items: []appsv1.Deployment{{ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "prod"}, Spec: appsv1.DeploymentSpec{Replicas: func() *int32 { value := int32(1); return &value }()}}}})
+		default:
+			writeJSONResponse(t, w, http.StatusOK, map[string]any{"kind": "Status", "apiVersion": "v1", "status": "Success"})
+		}
+	})
+
+	advisories, err := EvaluateUpgradeReadiness(ctx, cs, "", []Issue{{Kind: "APIServer", Severity: SeverityWarning, Check: "deprecated-apis", Summary: "deprecated API usage observed: apiserver_requested_deprecated_apis{group=\"extensions\",version=\"v1beta1\",resource=\"ingresses\"} 1"}}, "v1.31")
+	if err != nil {
+		t.Fatalf("EvaluateUpgradeReadiness returned error: %v", err)
+	}
+	if len(advisories) < 2 {
+		t.Fatalf("expected version-aware advisories, got %+v", advisories)
+	}
+	seenTarget := false
+	seenDeprecated := false
+	for _, advisory := range advisories {
+		if advisory.Title == "Cluster Version Path" && strings.Contains(advisory.Summary, "target v1.31") {
+			seenTarget = true
+		}
+		if advisory.Title == "Removed APIs In Target Version" && advisory.Severity == SeverityCritical && strings.Contains(advisory.Summary, "extensions/v1beta1 ingresses") && strings.Contains(advisory.Recommendation, "networking.k8s.io/v1") {
+			seenDeprecated = true
+		}
+	}
+	if !seenTarget || !seenDeprecated {
+		t.Fatalf("expected target-version advisories, got %+v", advisories)
+	}
+}
+
+func TestBuildRemovedAPIRecommendation(t *testing.T) {
+	recommendation := buildRemovedAPIRecommendation([]removedAPI{{
+		Group:     "batch",
+		Version:   "v1beta1",
+		Resource:  "cronjobs",
+		Successor: "batch/v1",
+		Note:      "CronJob GA API is batch/v1.",
+	}}, kubernetesVersion{Major: 1, Minor: 25, Raw: "v1.25"})
+	if !strings.Contains(recommendation, "batch/v1beta1 cronjobs -> batch/v1") || !strings.Contains(recommendation, "CronJob GA API is batch/v1") {
+		t.Fatalf("expected concrete migration hint, got %q", recommendation)
+	}
+}
+
+func TestEvaluateManifestUpgradeReadiness(t *testing.T) {
+	dir := t.TempDir()
+	manifestDir := filepath.Join(dir, "deploy")
+	if err := os.MkdirAll(manifestDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	deprecatedManifest := []byte("apiVersion: extensions/v1beta1\nkind: Ingress\nmetadata:\n  name: legacy\n")
+	if err := os.WriteFile(filepath.Join(manifestDir, "legacy-ingress.yaml"), deprecatedManifest, 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	advisories, err := EvaluateManifestUpgradeReadiness("v1.22", []string{manifestDir})
+	if err != nil {
+		t.Fatalf("EvaluateManifestUpgradeReadiness returned error: %v", err)
+	}
+	if len(advisories) != 1 {
+		t.Fatalf("expected one advisory, got %+v", advisories)
+	}
+	if advisories[0].Title != "Manifest API Compatibility" || advisories[0].Severity != SeverityCritical {
+		t.Fatalf("expected critical manifest compatibility advisory, got %+v", advisories[0])
+	}
+	if !strings.Contains(advisories[0].Summary, "legacy-ingress.yaml uses extensions/v1beta1 Ingress") {
+		t.Fatalf("expected summary to mention manifest blocker, got %q", advisories[0].Summary)
+	}
+	if !strings.Contains(advisories[0].Recommendation, "networking.k8s.io/v1") {
+		t.Fatalf("expected recommendation to mention successor API, got %q", advisories[0].Recommendation)
+	}
+
+	cleanDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cleanDir, "ingress.yaml"), []byte("apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: current\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	advisories, err = EvaluateManifestUpgradeReadiness("v1.29", []string{cleanDir})
+	if err != nil {
+		t.Fatalf("EvaluateManifestUpgradeReadiness returned error: %v", err)
+	}
+	if len(advisories) != 1 || advisories[0].Severity != SeverityInfo {
+		t.Fatalf("expected informational clean manifest advisory, got %+v", advisories)
+	}
+}
+
+func TestDeprecatedAPIRemovalBlockers(t *testing.T) {
+	target, err := parseKubernetesVersion("v1.25")
+	if err != nil {
+		t.Fatalf("parseKubernetesVersion returned error: %v", err)
+	}
+	blockers := deprecatedAPIRemovalBlockers([]Issue{{Summary: "deprecated API usage observed: apiserver_requested_deprecated_apis{group=\"policy\",version=\"v1beta1\",resource=\"podsecuritypolicies\"} 1"}}, target)
+	if len(blockers) != 1 || blockers[0].Resource != "podsecuritypolicies" || blockers[0].RemovedIn.Raw != "v1.25" {
+		t.Fatalf("expected PSP removal blocker for v1.25, got %+v", blockers)
+	}
+
+	target, err = parseKubernetesVersion("v1.24")
+	if err != nil {
+		t.Fatalf("parseKubernetesVersion returned error: %v", err)
+	}
+	blockers = deprecatedAPIRemovalBlockers([]Issue{{Summary: "deprecated API usage observed: apiserver_requested_deprecated_apis{group=\"policy\",version=\"v1beta1\",resource=\"podsecuritypolicies\"} 1"}}, target)
+	if len(blockers) != 0 {
+		t.Fatalf("expected PSP not to block before removal version, got %+v", blockers)
+	}
+
+	target, err = parseKubernetesVersion("v1.22")
+	if err != nil {
+		t.Fatalf("parseKubernetesVersion returned error: %v", err)
+	}
+	blockers = deprecatedAPIRemovalBlockers([]Issue{{Summary: "deprecated API usage observed: apiserver_requested_deprecated_apis{group=\"admissionregistration.k8s.io\",version=\"v1beta1\",resource=\"validatingwebhookconfigurations\"} 1"}}, target)
+	if len(blockers) != 1 || blockers[0].Group != "admissionregistration.k8s.io" || blockers[0].RemovedIn.Raw != "v1.22" {
+		t.Fatalf("expected webhook blocker for v1.22, got %+v", blockers)
+	}
+
+	target, err = parseKubernetesVersion("v1.27")
+	if err != nil {
+		t.Fatalf("parseKubernetesVersion returned error: %v", err)
+	}
+	blockers = deprecatedAPIRemovalBlockers([]Issue{{Summary: "deprecated API usage observed: apiserver_requested_deprecated_apis{group=\"storage.k8s.io\",version=\"v1beta1\",resource=\"csistoragecapacities\"} 1"}}, target)
+	if len(blockers) != 1 || blockers[0].Resource != "csistoragecapacities" || blockers[0].RemovedIn.Raw != "v1.27" {
+		t.Fatalf("expected CSIStorageCapacity blocker for v1.27, got %+v", blockers)
+	}
+
+	target, err = parseKubernetesVersion("v1.29")
+	if err != nil {
+		t.Fatalf("parseKubernetesVersion returned error: %v", err)
+	}
+	blockers = deprecatedAPIRemovalBlockers([]Issue{{Summary: "deprecated API usage observed: apiserver_requested_deprecated_apis{group=\"flowcontrol.apiserver.k8s.io\",version=\"v1beta2\",resource=\"flowschemas\"} 1"}}, target)
+	if len(blockers) != 1 || blockers[0].Version != "v1beta2" || blockers[0].RemovedIn.Raw != "v1.29" {
+		t.Fatalf("expected flowcontrol v1beta2 blocker for v1.29, got %+v", blockers)
+	}
+
+	target, err = parseKubernetesVersion("v1.32")
+	if err != nil {
+		t.Fatalf("parseKubernetesVersion returned error: %v", err)
+	}
+	blockers = deprecatedAPIRemovalBlockers([]Issue{{Summary: "deprecated API usage observed: apiserver_requested_deprecated_apis{group=\"flowcontrol.apiserver.k8s.io\",version=\"v1beta3\",resource=\"prioritylevelconfigurations\"} 1"}}, target)
+	if len(blockers) != 1 || blockers[0].Version != "v1beta3" || blockers[0].RemovedIn.Raw != "v1.32" {
+		t.Fatalf("expected flowcontrol v1beta3 blocker for v1.32, got %+v", blockers)
 	}
 }
 
@@ -406,7 +556,7 @@ func TestAnalysisOperationalSignalsWithHTTPClientset(t *testing.T) {
 		{Check: "pv-orphaned", Severity: SeverityInfo},
 	}
 
-	upgrade, err := EvaluateUpgradeReadiness(ctx, cs, "prod", issues)
+	upgrade, err := EvaluateUpgradeReadiness(ctx, cs, "prod", issues, "")
 	if err != nil || len(upgrade) < 3 {
 		t.Fatalf("unexpected upgrade advisories: advisories=%+v err=%v", upgrade, err)
 	}

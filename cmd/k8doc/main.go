@@ -33,6 +33,8 @@ func main() {
 	var reportPath string
 	var reportFormat string
 	var timelineLimit int
+	var targetK8sVersion string
+	var manifestPaths string
 	var compareContext string
 	var compareKubeconfig string
 	var suppressNoise bool
@@ -68,6 +70,8 @@ func main() {
 	flag.StringVar(&reportPath, "report", "", "Write a markdown or html report to this path")
 	flag.StringVar(&reportFormat, "report-format", "markdown", "Report format: markdown or html")
 	flag.IntVar(&timelineLimit, "timeline-limit", 20, "Maximum number of timeline entries to return")
+	flag.StringVar(&targetK8sVersion, "target-k8s-version", "", "Optional target Kubernetes version for upgrade validation, for example v1.31 or 1.31.2")
+	flag.StringVar(&manifestPaths, "manifest-paths", "", "Optional comma-separated manifest files or directories for repo-side upgrade validation; empty means auto-detect deploy, manifests, k8s, charts, or helm in the current directory")
 	flag.StringVar(&compareContext, "compare-context", "", "Secondary kubeconfig context used for multi-cluster comparison")
 	flag.StringVar(&compareKubeconfig, "compare-kubeconfig", "", "Optional kubeconfig path for the secondary comparison context")
 	flag.BoolVar(&suppressNoise, "suppress-noise", true, "Suppress built-in non-actionable informational findings")
@@ -108,6 +112,10 @@ func main() {
 	selectedChecks, err := validatedChecks(checks)
 	if err != nil {
 		fatalf("invalid checks: %v", err)
+	}
+	targetK8sVersion, err = diagnostics.NormalizeTargetKubernetesVersion(targetK8sVersion)
+	if err != nil {
+		fatalf("invalid target Kubernetes version: %v", err)
 	}
 	probeTargets, err := validatedProbeTargetClasses(probeTargetClasses)
 	if err != nil {
@@ -162,6 +170,8 @@ func main() {
 		FailOn:             failOn,
 		BaselinePath:       baselinePath,
 		WriteBaselinePath:  writeBaselinePath,
+		ManifestPaths:      splitCSV(manifestPaths),
+		targetK8sVersion:   targetK8sVersion,
 		Focus:              focus,
 		TimelineLimit:      timelineLimit,
 		AppliedRules:       append(appliedRules, suppressedNoise...),
@@ -271,6 +281,8 @@ type reportOptions struct {
 	TimelineLimit      int                   `json:"timelineLimit,omitempty"`
 	AppliedRules       []string              `json:"appliedRules,omitempty"`
 	StrictReportErrors bool                  `json:"strictReportErrors,omitempty"`
+	ManifestPaths      []string              `json:"manifestPaths,omitempty"`
+	targetK8sVersion   string
 }
 
 type scanReport struct {
@@ -469,7 +481,7 @@ func composeReport(ctx context.Context, checker *diagnostics.Checker, summary he
 	}
 	if need("upgrade-readiness") {
 		if err := runSection("upgrade-readiness", false, func() error {
-			advisories, err := diagnostics.EvaluateUpgradeReadiness(ctx, checker.Clientset(), namespace, issues)
+			advisories, err := diagnostics.EvaluateUpgradeReadiness(ctx, checker.Clientset(), namespace, issues, opts.targetK8sVersion)
 			if err != nil {
 				return err
 			}
@@ -491,6 +503,23 @@ func composeReport(ctx context.Context, checker *diagnostics.Checker, summary he
 			return report, err
 		}
 	}
+	if need("upgrade-readiness") {
+		if err := runSection("upgrade-readiness", false, func() error {
+			advisories, err := diagnostics.EvaluateUpgradeReadiness(ctx, checker.Clientset(), namespace, issues, opts.targetK8sVersion)
+			if err != nil {
+				return err
+			}
+			manifestAdvisories, err := diagnostics.EvaluateManifestUpgradeReadiness(opts.targetK8sVersion, opts.ManifestPaths)
+			if err != nil {
+				return err
+			}
+			advisories = append(advisories, manifestAdvisories...)
+			report.UpgradeReadiness = advisories
+			return nil
+		}); err != nil {
+			return report, err
+		}
+	}
 	if need("cost") {
 		if err := runSection("cost", false, func() error {
 			advisories, err := diagnostics.EvaluateCostWaste(ctx, checker.Clientset(), namespace, issues)
@@ -498,18 +527,6 @@ func composeReport(ctx context.Context, checker *diagnostics.Checker, summary he
 				return err
 			}
 			report.CostWaste = advisories
-			return nil
-		}); err != nil {
-			return report, err
-		}
-	}
-	if need("slo") {
-		if err := runSection("slo", false, func() error {
-			insights, err := diagnostics.BuildSLOInsights(ctx, checker.Clientset(), namespace, issues)
-			if err != nil {
-				return err
-			}
-			report.SLOInsights = insights
 			return nil
 		}); err != nil {
 			return report, err
@@ -572,6 +589,7 @@ func supportedModes() map[string]bool {
 		"incident":              true,
 		"explain":               true,
 		"diff":                  true,
+
 		"timeline":              true,
 		"dependencies":          true,
 		"service-view":          true,
@@ -606,6 +624,19 @@ func validatedMode(mode string) (string, error) {
 		return "", fmt.Errorf("unsupported mode %q", mode)
 	}
 	return mode, nil
+}
+
+func splitCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		result = append(result, trimmed)
+	}
+	return result
 }
 
 func applyProfile(checks, output, failOn, mode *string, profile string) {

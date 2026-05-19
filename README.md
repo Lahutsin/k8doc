@@ -1,6 +1,6 @@
 # k8doc
 
-Version: 0.1.3
+Version: 0.1.4
 
 Minimal Kubernetes troubleshooter written in Go. It connects to your cluster, runs a bundle of quick health checks, and prints a compact table of findings with recommendations.
 
@@ -91,6 +91,8 @@ Recent versions also add a production-oriented execution model: checks now run i
 | `./bin/k8doc --mode service-view --focus-kind service --focus api` | Inspect one service chain from ingress to backing workloads. |
 | `./bin/k8doc --mode node-pool-view` | Summarize findings by node pool. |
 | `./bin/k8doc --mode release-readiness --focus-kind namespace --focus prod` | Check release-readiness conditions for a production namespace. |
+| `./bin/k8doc --mode upgrade-readiness --target-k8s-version v1.31` | Estimate upgrade blockers for a specific target Kubernetes version, including auto-detected repo manifests under `deploy/`, `manifests/`, `k8s/`, `charts/`, or `helm/`, with Helm template literal and helper-template resolution for `apiVersion` and `kind`, plus a separate warning when templates still need manual review. |
+| `./bin/k8doc --mode upgrade-readiness --target-k8s-version v1.29 --manifest-paths deploy,charts/api` | Validate specific manifest directories or files against APIs removed in the target Kubernetes version. |
 | `./bin/k8doc --mode multi-cluster-compare --context prod-eu --compare-context prod-us` | Compare findings between two kubeconfig contexts. |
 | `./bin/k8doc --mode slo --focus-kind namespace --focus payments` | Show SLO-oriented risk analysis for one namespace. |
 | `./bin/k8doc --mode full --report k8doc.html --report-format html` | Generate a full HTML report. |
@@ -109,7 +111,7 @@ Recent versions also add a production-oriented execution model: checks now run i
 - `network-path`: DNS -> ingress/service -> endpoints style path view
 - `storage-path`: PVC -> StorageClass -> PV -> VolumeAttachment -> node path view
 - `release-readiness`: deployment gate view for quota, PDB, image pull secrets, webhooks, ingress TLS, HPA, and storage
-- `upgrade-readiness`: advisory view for node drains, PDBs, webhooks, and single-replica workloads
+- `upgrade-readiness`: advisory view for node drains, PDBs, webhooks, single-replica workloads, and version-aware upgrade blockers when `--target-k8s-version` is set
 - `security`: security posture summary including webhook/cert findings, privileged pods, hostPath usage, and default service accounts
 - `cost`: waste-oriented view for scaled-zero workloads, orphaned volumes, and idle load balancers
 - `slo`: service-oriented availability risk view with a simple blast-radius estimate
@@ -134,6 +136,8 @@ Recent versions also add a production-oriented execution model: checks now run i
 | `--baseline` | Path to a saved JSON baseline used for diff mode. |
 | `--write-baseline` | Path to write the current scan as a new baseline. |
 | `--timeline-limit` | Maximum number of timeline entries to include. |
+| `--target-k8s-version` | Optional target Kubernetes version, for example `v1.31`, used to make `upgrade-readiness` advisories version-aware. |
+| `--manifest-paths` | Optional comma-separated manifest files or directories for repo-side upgrade validation. Empty means auto-detect `deploy/`, `manifests/`, `k8s/`, `charts/`, or `helm/` in the current directory. |
 | `--rules` | Path to a YAML or JSON rules file for suppression and severity overrides. |
 | `--suppress-noise` | Suppress built-in low-signal informational findings. |
 | `--strict-check-errors` | Fail the run if any individual check returns an execution error instead of degrading to partial results. |

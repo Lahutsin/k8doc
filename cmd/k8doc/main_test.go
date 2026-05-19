@@ -327,6 +327,9 @@ func TestDefaultChecksAndParseChecks(t *testing.T) {
 	if _, err := validatedMode("broken"); err == nil || !strings.Contains(err.Error(), "broken") {
 		t.Fatalf("expected unsupported mode error, got %v", err)
 	}
+	if normalized, err := diagnostics.NormalizeTargetKubernetesVersion("1.31.7"); err != nil || normalized != "v1.31" {
+		t.Fatalf("expected normalized target Kubernetes version, got %q err=%v", normalized, err)
+	}
 }
 
 func TestApplyProfile(t *testing.T) {
@@ -555,6 +558,68 @@ func TestComposeReportStrictReportErrors(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected strict report errors to fail composeReport")
+	}
+}
+
+func TestComposeReportUpgradeReadinessIncludesManifestCompatibility(t *testing.T) {
+	manifestDir := t.TempDir()
+	manifestPath := filepath.Join(manifestDir, "legacy-ingress.yaml")
+	if err := os.WriteFile(manifestPath, []byte("apiVersion: extensions/v1beta1\nkind: Ingress\nmetadata:\n  name: legacy\n"), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	report, err := composeReport(nil, nil, buildHealthSummary(sampleIssues()), sampleIssues(), reportOptions{
+		Mode:             "upgrade-readiness",
+		Output:           "table",
+		targetK8sVersion: "v1.22",
+		ManifestPaths:    []string{manifestDir},
+	})
+	if err != nil {
+		t.Fatalf("composeReport returned error: %v", err)
+	}
+	seenManifest := false
+	for _, advisory := range report.UpgradeReadiness {
+		if advisory.Title == "Manifest API Compatibility" && strings.Contains(advisory.Recommendation, "networking.k8s.io/v1") {
+			seenManifest = true
+		}
+	}
+	if !seenManifest {
+		t.Fatalf("expected manifest compatibility advisory, got %+v", report.UpgradeReadiness)
+	}
+}
+
+func TestComposeReportUpgradeReadinessIncludesManifestUncertainty(t *testing.T) {
+	manifestDir := t.TempDir()
+	manifestPath := filepath.Join(manifestDir, "uncertain-ingress.yaml")
+	if err := os.WriteFile(manifestPath, []byte("apiVersion: {{ include \"demo.missingApiVersion\" . }}\nkind: Ingress\nmetadata:\n  name: uncertain\n"), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	report, err := composeReport(nil, nil, buildHealthSummary(sampleIssues()), sampleIssues(), reportOptions{
+		Mode:             "upgrade-readiness",
+		Output:           "table",
+		targetK8sVersion: "v1.22",
+		ManifestPaths:    []string{manifestDir},
+	})
+	if err != nil {
+		t.Fatalf("composeReport returned error: %v", err)
+	}
+	seenUncertainty := false
+	for _, advisory := range report.UpgradeReadiness {
+		if advisory.Title == "Manifest Template Resolution Uncertainty" && strings.Contains(advisory.Summary, "demo.missingApiVersion") {
+			seenUncertainty = true
+		}
+	}
+	if !seenUncertainty {
+		t.Fatalf("expected manifest uncertainty advisory, got %+v", report.UpgradeReadiness)
+	}
+	}
+
+func TestSplitCSV(t *testing.T) {
+	values := splitCSV(" deploy , charts/api ,, helm/demo ")
+	if len(values) != 3 || values[0] != "deploy" || values[1] != "charts/api" || values[2] != "helm/demo" {
+		t.Fatalf("unexpected splitCSV values: %+v", values)
+	}
+	if values := splitCSV(" , , "); len(values) != 0 {
+		t.Fatalf("expected empty splitCSV values, got %+v", values)
 	}
 }
 
@@ -1056,6 +1121,39 @@ func TestMainExitsForUnknownMode(t *testing.T) {
 	}
 	if !strings.Contains(string(output), "unsupported mode \"broken\"") {
 		t.Fatalf("expected unsupported mode message, got %s", string(output))
+	}
+}
+
+func TestMainExitsForInvalidTargetKubernetesVersion(t *testing.T) {
+	if os.Getenv("KDOC_MAIN_INVALID_TARGET_VERSION_SUBPROCESS") == "1" {
+		oldArgs := os.Args
+		oldCommandLine := flag.CommandLine
+		defer func() {
+			os.Args = oldArgs
+			flag.CommandLine = oldCommandLine
+		}()
+
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+		os.Args = []string{
+			"k8doc",
+			"-target-k8s-version", "broken",
+		}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestMainExitsForInvalidTargetKubernetesVersion")
+	cmd.Env = append(os.Environ(), "KDOC_MAIN_INVALID_TARGET_VERSION_SUBPROCESS=1")
+	output, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected exit error, got %v output=%s", err, string(output))
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got %d output=%s", exitErr.ExitCode(), string(output))
+	}
+	if !strings.Contains(string(output), "invalid target Kubernetes version") {
+		t.Fatalf("expected invalid target version message, got %s", string(output))
 	}
 }
 

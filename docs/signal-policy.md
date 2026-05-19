@@ -24,3 +24,8 @@
 
 - The code normalizes missing `category`, `detection`, and `confidence` fields.
 - `ValidateIssuePolicy` and `ValidateIssuesPolicy` enforce allowed values and required fields in tests.
+
+## Upgrade Advisories
+
+- `upgrade-readiness` advisory sections may intentionally emit `warning` severity for unresolved manifest template logic even when no direct removed API was proven.
+- `Manifest Template Resolution Uncertainty` is a manual-review signal rather than a confirmed blocker: it marks Helm or manifest branches that could not be resolved into concrete `apiVersion` or `kind` values.

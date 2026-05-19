@@ -15,5 +15,7 @@
 ## Usage Notes
 
 - Typical deployment flow: download the matching `k8doc` binary or archive from GitHub Releases, extract it on the operator host, apply one RBAC profile from this directory, and then run the binary against the target cluster.
+- Typical pre-upgrade flow: apply the desired RBAC profile, then run `./k8doc --mode upgrade-readiness --target-k8s-version v1.31 --manifest-paths deploy/rbac` or point `--manifest-paths` at the repo directories that contain the manifests or charts being promoted.
 - Update the namespace fields in `k8doc-namespace-reader.yaml` before applying it.
 - Prefer namespace-only for tenant self-service, minimal read-only for shared platform diagnostics, and cluster-reader for full cluster posture scans.
+- If the report includes `Manifest Template Resolution Uncertainty`, render or inspect the referenced Helm templates manually before approving the upgrade.
