@@ -14,5 +14,6 @@
 
 ## Usage Notes
 
+- Typical deployment flow: download the matching `k8doc` binary or archive from GitHub Releases, extract it on the operator host, apply one RBAC profile from this directory, and then run the binary against the target cluster.
 - Update the namespace fields in `k8doc-namespace-reader.yaml` before applying it.
 - Prefer namespace-only for tenant self-service, minimal read-only for shared platform diagnostics, and cluster-reader for full cluster posture scans.

@@ -7,8 +7,16 @@
 - Run `go test ./internal/diagnostics -run 'Test(PagedList|ListPodsCached|CollectCapabilityPreflight|TransientError|IssuePolicy)'` to validate runtime guardrails and signal policy.
 - Run `go test ./internal/diagnostics -run '^$' -bench 'Benchmark(PagedList|ListPodsCached|NormalizeIssues)' -benchmem` to record runtime regression metrics.
 
+## Releases
+
+- Push a semantic tag such as `v1.2.3` to trigger `./.github/workflows/release.yml`.
+- The release workflow reruns the repository test, output-contract, and runtime-guardrail gates before publishing artifacts.
+- Published GitHub Release assets include platform-specific raw binaries, packaged archives, and `checksums.txt`.
+- Tags containing `-alpha`, `-beta`, or `-rc` are published as prereleases automatically.
+
 ## In-Cluster
 
+- For operator or support use, prefer downloading a published release binary from GitHub Releases instead of building from source on the target host.
 - Apply one of the RBAC profiles in `deploy/rbac/` depending on scope.
 - Run with `--output json` for machine-readable artifact collection.
 - Use `--enable-active-probes` and `--enable-host-network-probes` only when the execution environment is allowed to reach API-proxy or host-network targets.
