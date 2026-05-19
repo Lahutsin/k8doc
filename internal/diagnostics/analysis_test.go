@@ -162,6 +162,9 @@ func TestAnalysisFilteringRulesAndRemediations(t *testing.T) {
 	if !focusMatchesIssue(FocusSpec{Kind: "node", Value: "node-a"}, issues[1]) {
 		t.Fatal("expected node focus match")
 	}
+	if focusMatchesIssue(FocusSpec{Kind: "node", Value: "node-a"}, Issue{Kind: "Pod", Namespace: "prod", Name: "api", Summary: "scheduled on node-a"}) {
+		t.Fatal("expected node focus to exclude non-node issues even when summary mentions node")
+	}
 	if !focusMatchesObject(FocusSpec{Kind: "app", Value: "web"}, "prod", "svc", map[string]string{"app": "web"}, "") {
 		t.Fatal("expected app focus match")
 	}

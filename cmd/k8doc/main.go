@@ -63,7 +63,7 @@ func main() {
 	flag.StringVar(&mode, "mode", "scan", "Mode: scan, incident, explain, diff, timeline, dependencies, service-view, node-pool-view, network-path, storage-path, release-readiness, upgrade-readiness, security, cost, slo, remediation, multi-cluster-compare, full")
 	flag.StringVar(&focusKind, "focus-kind", "", "Focus type: namespace, app, node, service, node-pool")
 	flag.StringVar(&focusValue, "focus", "", "Focus value used to narrow issues and analysis views")
-	flag.StringVar(&profile, "profile", "", "Profile preset: quick, prod, pre-upgrade, network, storage, admission, cost, ci")
+	flag.StringVar(&profile, "profile", "", "Profile preset: quick, prod, pre-upgrade, network, incident, release, storage, admission, cost, ci")
 	flag.StringVar(&rulesPath, "rules", "", "Path to a YAML or JSON rules file for severity overrides or suppression")
 	flag.StringVar(&reportPath, "report", "", "Write a markdown or html report to this path")
 	flag.StringVar(&reportFormat, "report-format", "markdown", "Report format: markdown or html")
@@ -87,7 +87,16 @@ func main() {
 	flag.StringVar(&logFormat, "log-format", "off", "Runtime log format: off, text, or json")
 	flag.Parse()
 
+	validatedProfile, err := validatedProfile(profile)
+	if err != nil {
+		fatalf("invalid profile: %v", err)
+	}
+	profile = validatedProfile
 	applyProfile(&checks, &output, &failOn, &mode, profile)
+	mode, err = validatedMode(mode)
+	if err != nil {
+		fatalf("invalid mode: %v", err)
+	}
 	if focusKind == "namespace" && namespace == "" && focusValue != "" {
 		namespace = focusValue
 	}
@@ -96,7 +105,16 @@ func main() {
 		kubeconfig = diagnostics.DefaultKubeconfig()
 	}
 
-	checker, err := diagnostics.NewChecker(kubeconfig, kubeContext, namespace, parseChecks(checks), time.Duration(timeoutSec)*time.Second)
+	selectedChecks, err := validatedChecks(checks)
+	if err != nil {
+		fatalf("invalid checks: %v", err)
+	}
+	probeTargets, err := validatedProbeTargetClasses(probeTargetClasses)
+	if err != nil {
+		fatalf("invalid probe target classes: %v", err)
+	}
+
+	checker, err := diagnostics.NewChecker(kubeconfig, kubeContext, namespace, selectedChecks, time.Duration(timeoutSec)*time.Second)
 	if err != nil {
 		fatalf("init client: %v", err)
 	}
@@ -114,7 +132,7 @@ func main() {
 	diagnostics.SetProbePolicy(diagnostics.ProbePolicy{
 		EnableActiveProbes:      enableActiveProbes,
 		EnableHostNetworkProbes: enableHostNetworkProbes,
-		TargetClasses:           parseChecks(probeTargetClasses),
+		TargetClasses:           probeTargets,
 		TLSProbeMode:            tlsProbeMode,
 	})
 
@@ -533,6 +551,63 @@ func defaultChecks() string {
 	return "pods,gpu,runtimebehavior,podsecurity,secrets,configexposure,networksecurity,storagesecurity,multitenancy,managedk8s,observability,policy,nodes,events,controllers,apiserver,rbac,serviceaccounts,webhooks,cni,controlplane,dns,storage,certificates,quotas,ingress,autoscaling,pdb,scheduling,trends"
 }
 
+func supportedProfiles() map[string]bool {
+	return map[string]bool{
+		"quick":       true,
+		"prod":        true,
+		"pre-upgrade": true,
+		"network":     true,
+		"incident":    true,
+		"release":     true,
+		"storage":     true,
+		"admission":   true,
+		"cost":        true,
+		"ci":          true,
+	}
+}
+
+func supportedModes() map[string]bool {
+	return map[string]bool{
+		"scan":                  true,
+		"incident":              true,
+		"explain":               true,
+		"diff":                  true,
+		"timeline":              true,
+		"dependencies":          true,
+		"service-view":          true,
+		"node-pool-view":        true,
+		"network-path":          true,
+		"storage-path":          true,
+		"release-readiness":     true,
+		"upgrade-readiness":     true,
+		"security":              true,
+		"cost":                  true,
+		"slo":                   true,
+		"remediation":           true,
+		"multi-cluster-compare": true,
+		"full":                  true,
+	}
+}
+
+func validatedProfile(profile string) (string, error) {
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
+		return "", nil
+	}
+	if !supportedProfiles()[profile] {
+		return "", fmt.Errorf("unsupported profile %q", profile)
+	}
+	return profile, nil
+}
+
+func validatedMode(mode string) (string, error) {
+	mode = strings.TrimSpace(mode)
+	if !supportedModes()[mode] {
+		return "", fmt.Errorf("unsupported mode %q", mode)
+	}
+	return mode, nil
+}
+
 func applyProfile(checks, output, failOn, mode *string, profile string) {
 	switch strings.TrimSpace(profile) {
 	case "quick":
@@ -612,6 +687,38 @@ func parseChecks(csv string) map[string]bool {
 		result[p] = true
 	}
 	return result
+}
+
+func validatedChecks(csv string) (map[string]bool, error) {
+	selected := parseChecks(csv)
+	unsupported := make([]string, 0)
+	supported := diagnostics.SupportedChecks()
+	for check := range selected {
+		if !supported[check] {
+			unsupported = append(unsupported, check)
+		}
+	}
+	if len(unsupported) > 0 {
+		sort.Strings(unsupported)
+		return nil, fmt.Errorf("unsupported check(s): %s", strings.Join(unsupported, ", "))
+	}
+	return selected, nil
+}
+
+func validatedProbeTargetClasses(csv string) (map[string]bool, error) {
+	selected := parseChecks(csv)
+	unsupported := make([]string, 0)
+	supported := diagnostics.SupportedProbeTargetClasses()
+	for targetClass := range selected {
+		if !supported[targetClass] {
+			unsupported = append(unsupported, targetClass)
+		}
+	}
+	if len(unsupported) > 0 {
+		sort.Strings(unsupported)
+		return nil, fmt.Errorf("unsupported probe target class(es): %s", strings.Join(unsupported, ", "))
+	}
+	return selected, nil
 }
 
 func buildHealthSummary(issues []diagnostics.Issue) healthSummary {
@@ -929,7 +1036,7 @@ func loadAndCompareBaseline(path string, current []diagnostics.Issue) (*baseline
 			diff.NewIssues = append(diff.NewIssues, issue)
 			continue
 		}
-		if severityWeight(issue.Severity) > severityWeight(prev.Severity) {
+		if baselineIssueWorsened(prev, issue) {
 			diff.WorsenedCount++
 			diff.Worsened = append(diff.Worsened, issue)
 		}
@@ -941,6 +1048,13 @@ func loadAndCompareBaseline(path string, current []diagnostics.Issue) (*baseline
 		}
 	}
 	return diff, nil
+}
+
+// baselineIssueWorsened only compares severity for the same issue identity.
+// Issue identity is defined by diagnostics.Issue.Key(), so summary changes are
+// treated as a resolved issue plus a new issue rather than a worsening.
+func baselineIssueWorsened(previous, current diagnostics.Issue) bool {
+	return severityWeight(current.Severity) > severityWeight(previous.Severity)
 }
 
 func writeBaseline(path string, report scanReport) error {
@@ -1117,9 +1231,6 @@ func buildComparisonReport(input compareInput) (*diagnostics.ClusterComparison, 
 	}
 	issues, _ = diagnostics.ApplyBuiltInNoiseSuppression(issues, input.SuppressNoise)
 	issues = diagnostics.FilterIssuesByFocus(issues, input.Focus)
-	if input.Focus.Kind == "" && input.Namespace == "" {
-		issues = issues
-	}
 	sortIssues(issues)
 	compareSummary := buildHealthSummary(issues)
 	comparison := diagnostics.CompareIssueSets(input.BaseContext, input.CompareContext, input.CurrentIssues, issues, input.CurrentScore, compareSummary.Score)

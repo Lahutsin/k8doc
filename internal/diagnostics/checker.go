@@ -125,6 +125,42 @@ func (c *Checker) APICallCount() int64 {
 	return atomic.LoadInt64(c.apiCalls)
 }
 
+// SupportedChecks returns the full set of diagnostic checks understood by the runtime.
+func SupportedChecks() map[string]bool {
+	return map[string]bool{
+		"pods":            true,
+		"gpu":             true,
+		"runtimebehavior": true,
+		"podsecurity":     true,
+		"secrets":         true,
+		"configexposure":  true,
+		"networksecurity": true,
+		"storagesecurity": true,
+		"multitenancy":    true,
+		"managedk8s":      true,
+		"observability":   true,
+		"policy":          true,
+		"nodes":           true,
+		"events":          true,
+		"controllers":     true,
+		"apiserver":       true,
+		"rbac":            true,
+		"serviceaccounts": true,
+		"webhooks":        true,
+		"cni":             true,
+		"controlplane":    true,
+		"dns":             true,
+		"storage":         true,
+		"certificates":    true,
+		"quotas":          true,
+		"ingress":         true,
+		"autoscaling":     true,
+		"pdb":             true,
+		"scheduling":      true,
+		"trends":          true,
+	}
+}
+
 // NewChecker builds a clientset using the provided kubeconfig and context name.
 func NewChecker(kubeconfigPath, kubeContext, namespace string, enabled map[string]bool, timeout time.Duration) (*Checker, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
@@ -174,38 +210,7 @@ func NewChecker(kubeconfigPath, kubeContext, namespace string, enabled map[strin
 	}
 
 	if len(enabled) == 0 {
-		enabled = map[string]bool{
-			"pods":            true,
-			"gpu":             true,
-			"runtimebehavior": true,
-			"podsecurity":     true,
-			"secrets":         true,
-			"configexposure":  true,
-			"networksecurity": true,
-			"storagesecurity": true,
-			"multitenancy":    true,
-			"managedk8s":      true,
-			"observability":   true,
-			"policy":          true,
-			"nodes":           true,
-			"events":          true,
-			"controllers":     true,
-			"apiserver":       true,
-			"rbac":            true,
-			"serviceaccounts": true,
-			"webhooks":        true,
-			"cni":             true,
-			"controlplane":    true,
-			"dns":             true,
-			"storage":         true,
-			"certificates":    true,
-			"quotas":          true,
-			"ingress":         true,
-			"autoscaling":     true,
-			"pdb":             true,
-			"scheduling":      true,
-			"trends":          true,
-		}
+		enabled = SupportedChecks()
 	}
 	if timeout <= 0 {
 		timeout = 30 * time.Second

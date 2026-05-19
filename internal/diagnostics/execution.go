@@ -83,6 +83,17 @@ func defaultProbePolicy() ProbePolicy {
 	}
 }
 
+func SupportedProbeTargetClasses() map[string]bool {
+	return map[string]bool{
+		"controlplane": true,
+		"dns":          true,
+		"ingress":      true,
+		"node":         true,
+		"registry":     true,
+		"webhook":      true,
+	}
+}
+
 func NormalizeProbePolicy(policy ProbePolicy) ProbePolicy {
 	if policy.TargetClasses == nil {
 		policy.TargetClasses = map[string]bool{}

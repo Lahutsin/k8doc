@@ -292,6 +292,41 @@ func TestDefaultChecksAndParseChecks(t *testing.T) {
 			t.Fatalf("expected check %q to be enabled", key)
 		}
 	}
+
+	validated, err := validatedChecks("pods, nodes")
+	if err != nil {
+		t.Fatalf("validatedChecks returned error: %v", err)
+	}
+	if len(validated) != 2 || !validated["pods"] || !validated["nodes"] {
+		t.Fatalf("unexpected validated checks: %+v", validated)
+	}
+	if _, err := validatedChecks("pods, nope"); err == nil || !strings.Contains(err.Error(), "nope") {
+		t.Fatalf("expected unsupported check error, got %v", err)
+	}
+	probeTargets, err := validatedProbeTargetClasses("ingress, dns")
+	if err != nil {
+		t.Fatalf("validatedProbeTargetClasses returned error: %v", err)
+	}
+	if len(probeTargets) != 2 || !probeTargets["ingress"] || !probeTargets["dns"] {
+		t.Fatalf("unexpected validated probe target classes: %+v", probeTargets)
+	}
+	if _, err := validatedProbeTargetClasses("ingress, typo"); err == nil || !strings.Contains(err.Error(), "typo") {
+		t.Fatalf("expected unsupported probe target class error, got %v", err)
+	}
+	validatedProfileName, err := validatedProfile(" incident ")
+	if err != nil || validatedProfileName != "incident" {
+		t.Fatalf("expected trimmed validated profile, got %q err=%v", validatedProfileName, err)
+	}
+	if _, err := validatedProfile("broken"); err == nil || !strings.Contains(err.Error(), "broken") {
+		t.Fatalf("expected unsupported profile error, got %v", err)
+	}
+	validatedModeName, err := validatedMode("full")
+	if err != nil || validatedModeName != "full" {
+		t.Fatalf("expected validated mode, got %q err=%v", validatedModeName, err)
+	}
+	if _, err := validatedMode("broken"); err == nil || !strings.Contains(err.Error(), "broken") {
+		t.Fatalf("expected unsupported mode error, got %v", err)
+	}
 }
 
 func TestApplyProfile(t *testing.T) {
@@ -341,6 +376,35 @@ func TestApplyProfile(t *testing.T) {
 				t.Fatalf("output mismatch: got %q want %q", output, test.wantOutput)
 			}
 		})
+	}
+}
+
+func TestProfilesAndDefaultChecksUseSupportedChecks(t *testing.T) {
+	supported := diagnostics.SupportedChecks()
+	profileChecks := map[string]string{
+		"default":     defaultChecks(),
+		"quick":       "pods,nodes,events,apiserver",
+		"prod":        defaultChecks(),
+		"pre-upgrade": defaultChecks(),
+		"network":     "nodes,dns,ingress,cni,webhooks,events,scheduling",
+		"incident":    "pods,gpu,nodes,apiserver,controlplane,dns,cni,ingress,webhooks,storage,events",
+		"release":     "quotas,pdb,pods,webhooks,ingress,autoscaling,storage,events",
+		"storage":     "storage,pods,cni,events",
+		"admission":   "webhooks,certificates,apiserver,events",
+		"cost":        "controllers,storage,autoscaling,quotas,ingress",
+		"ci":          defaultChecks(),
+	}
+
+	for profile, csv := range profileChecks {
+		parsed := parseChecks(csv)
+		if len(parsed) == 0 {
+			t.Fatalf("expected checks for profile %q", profile)
+		}
+		for check := range parsed {
+			if !supported[check] {
+				t.Fatalf("profile %q references unsupported check %q", profile, check)
+			}
+		}
 	}
 }
 
@@ -713,6 +777,51 @@ func TestLoadAndCompareBaseline(t *testing.T) {
 	}
 }
 
+func TestLoadAndCompareBaselineWorseningSemantics(t *testing.T) {
+	previous := scanReport{
+		Issues: []diagnostics.Issue{
+			{Kind: "Pod", Namespace: "team-a", Name: "api", Check: "pods", Summary: "same issue", Severity: diagnostics.SeverityWarning},
+			{Kind: "Pod", Namespace: "team-a", Name: "worker", Check: "pods", Summary: "old summary", Severity: diagnostics.SeverityWarning},
+		},
+	}
+	path := filepath.Join(t.TempDir(), "baseline.json")
+	data, err := json.Marshal(previous)
+	if err != nil {
+		t.Fatalf("marshal previous report: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write previous report: %v", err)
+	}
+
+	current := []diagnostics.Issue{
+		{Kind: "Pod", Namespace: "team-a", Name: "api", Check: "pods", Summary: "same issue", Severity: diagnostics.SeverityWarning},
+		{Kind: "Pod", Namespace: "team-a", Name: "worker", Check: "pods", Summary: "new summary", Severity: diagnostics.SeverityWarning},
+	}
+
+	diff, err := loadAndCompareBaseline(path, current)
+	if err != nil {
+		t.Fatalf("loadAndCompareBaseline returned error: %v", err)
+	}
+	if diff.WorsenedCount != 0 || len(diff.Worsened) != 0 {
+		t.Fatalf("expected same-severity and changed-summary issues to avoid worsening, got %+v", diff)
+	}
+	if diff.NewCount != 1 || diff.ResolvedCount != 1 {
+		t.Fatalf("expected summary change to be treated as replace, got %+v", diff)
+	}
+	if !baselineIssueWorsened(
+		diagnostics.Issue{Severity: diagnostics.SeverityInfo},
+		diagnostics.Issue{Severity: diagnostics.SeverityCritical},
+	) {
+		t.Fatal("expected higher severity to count as worsening")
+	}
+	if baselineIssueWorsened(
+		diagnostics.Issue{Severity: diagnostics.SeverityWarning},
+		diagnostics.Issue{Severity: diagnostics.SeverityWarning},
+	) {
+		t.Fatal("expected equal severity to avoid worsening")
+	}
+}
+
 func TestMeetsFailThresholdAndSeverityWeight(t *testing.T) {
 	issues := sampleIssues()
 	if meetsFailThreshold(issues, "") {
@@ -818,12 +927,146 @@ func TestMainExitsForInvalidKubeconfig(t *testing.T) {
 	}
 }
 
-func TestMainSucceedsWithNoopChecksAndJSON(t *testing.T) {
+func TestMainExitsForUnknownChecks(t *testing.T) {
+	if os.Getenv("KDOC_MAIN_UNKNOWN_CHECK_SUBPROCESS") == "1" {
+		oldArgs := os.Args
+		oldCommandLine := flag.CommandLine
+		defer func() {
+			os.Args = oldArgs
+			flag.CommandLine = oldCommandLine
+		}()
+
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+		os.Args = []string{
+			"k8doc",
+			"-checks", "noop",
+		}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestMainExitsForUnknownChecks")
+	cmd.Env = append(os.Environ(), "KDOC_MAIN_UNKNOWN_CHECK_SUBPROCESS=1")
+	output, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected exit error, got %v output=%s", err, string(output))
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got %d output=%s", exitErr.ExitCode(), string(output))
+	}
+	if !strings.Contains(string(output), "unsupported check(s): noop") {
+		t.Fatalf("expected unsupported check message, got %s", string(output))
+	}
+}
+
+func TestMainExitsForUnknownProbeTargetClasses(t *testing.T) {
+	if os.Getenv("KDOC_MAIN_UNKNOWN_PROBE_CLASS_SUBPROCESS") == "1" {
+		oldArgs := os.Args
+		oldCommandLine := flag.CommandLine
+		defer func() {
+			os.Args = oldArgs
+			flag.CommandLine = oldCommandLine
+		}()
+
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+		os.Args = []string{
+			"k8doc",
+			"-probe-target-classes", "ingress,typo",
+		}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestMainExitsForUnknownProbeTargetClasses")
+	cmd.Env = append(os.Environ(), "KDOC_MAIN_UNKNOWN_PROBE_CLASS_SUBPROCESS=1")
+	output, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected exit error, got %v output=%s", err, string(output))
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got %d output=%s", exitErr.ExitCode(), string(output))
+	}
+	if !strings.Contains(string(output), "unsupported probe target class(es): typo") {
+		t.Fatalf("expected unsupported probe target class message, got %s", string(output))
+	}
+}
+
+func TestMainExitsForUnknownProfile(t *testing.T) {
+	if os.Getenv("KDOC_MAIN_UNKNOWN_PROFILE_SUBPROCESS") == "1" {
+		oldArgs := os.Args
+		oldCommandLine := flag.CommandLine
+		defer func() {
+			os.Args = oldArgs
+			flag.CommandLine = oldCommandLine
+		}()
+
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+		os.Args = []string{
+			"k8doc",
+			"-profile", "broken",
+		}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestMainExitsForUnknownProfile")
+	cmd.Env = append(os.Environ(), "KDOC_MAIN_UNKNOWN_PROFILE_SUBPROCESS=1")
+	output, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected exit error, got %v output=%s", err, string(output))
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got %d output=%s", exitErr.ExitCode(), string(output))
+	}
+	if !strings.Contains(string(output), "unsupported profile \"broken\"") {
+		t.Fatalf("expected unsupported profile message, got %s", string(output))
+	}
+}
+
+func TestMainExitsForUnknownMode(t *testing.T) {
+	if os.Getenv("KDOC_MAIN_UNKNOWN_MODE_SUBPROCESS") == "1" {
+		oldArgs := os.Args
+		oldCommandLine := flag.CommandLine
+		defer func() {
+			os.Args = oldArgs
+			flag.CommandLine = oldCommandLine
+		}()
+
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+		os.Args = []string{
+			"k8doc",
+			"-mode", "broken",
+		}
+		main()
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestMainExitsForUnknownMode")
+	cmd.Env = append(os.Environ(), "KDOC_MAIN_UNKNOWN_MODE_SUBPROCESS=1")
+	output, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected exit error, got %v output=%s", err, string(output))
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got %d output=%s", exitErr.ExitCode(), string(output))
+	}
+	if !strings.Contains(string(output), "unsupported mode \"broken\"") {
+		t.Fatalf("expected unsupported mode message, got %s", string(output))
+	}
+}
+
+func TestMainSucceedsWithValidChecksAndJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api":
 			_, _ = w.Write([]byte(`{"kind":"APIVersions","versions":["v1"],"serverAddressByClientCIDRs":[]}`))
+		case "/api/v1/pods":
+			_, _ = w.Write([]byte(`{"kind":"PodList","apiVersion":"v1","items":[]}`))
 		default:
 			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Success"}`))
 		}
@@ -847,7 +1090,7 @@ func TestMainSucceedsWithNoopChecksAndJSON(t *testing.T) {
 		os.Args = []string{
 			"k8doc",
 			"-kubeconfig", os.Getenv("KDOC_TEST_KUBECONFIG"),
-			"-checks", "noop",
+			"-checks", "pods",
 			"-output", "json",
 			"-enable-active-probes",
 			"-enable-host-network-probes",
@@ -858,7 +1101,7 @@ func TestMainSucceedsWithNoopChecksAndJSON(t *testing.T) {
 		return
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestMainSucceedsWithNoopChecksAndJSON")
+	cmd := exec.Command(os.Args[0], "-test.run=TestMainSucceedsWithValidChecksAndJSON")
 	cmd.Env = append(os.Environ(), "KDOC_MAIN_SUCCESS_SUBPROCESS=1", "KDOC_TEST_KUBECONFIG="+kubeconfigPath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {

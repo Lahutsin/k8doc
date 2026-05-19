@@ -585,10 +585,6 @@ func ApplyBuiltInNoiseSuppression(issues []Issue, enabled bool) ([]Issue, []stri
 }
 
 func FilterIncidentIssues(issues []Issue) []Issue {
-	criticalChecks := map[string]bool{
-		"pods": true,
-	}
-	_ = criticalChecks
 	filtered := make([]Issue, 0, len(issues))
 	for _, issue := range issues {
 		if issue.Severity == SeverityInfo {
@@ -943,7 +939,10 @@ func focusMatchesIssue(focus FocusSpec, issue Issue) bool {
 	case "namespace":
 		return strings.EqualFold(issue.Namespace, focus.Value)
 	case "node":
-		return issue.Kind == "Node" && strings.EqualFold(issue.Name, focus.Value) || strings.Contains(strings.ToLower(issue.Summary), value)
+		if issue.Kind != "Node" {
+			return false
+		}
+		return strings.EqualFold(issue.Name, focus.Value) || strings.Contains(strings.ToLower(issue.Summary), value)
 	case "app":
 		return strings.Contains(strings.ToLower(issue.Name), value) || strings.Contains(strings.ToLower(issue.Summary), value)
 	default:

@@ -15,6 +15,9 @@ func TestExecutionHelpers(t *testing.T) {
 	if policy.TLSProbeMode != "verify" || policy.TargetClasses == nil {
 		t.Fatalf("unexpected normalized policy: %+v", policy)
 	}
+	if supported := SupportedProbeTargetClasses(); !supported["ingress"] || !supported["registry"] || !supported["webhook"] {
+		t.Fatalf("unexpected supported probe target classes: %+v", supported)
+	}
 	policy = NormalizeProbePolicy(ProbePolicy{TLSProbeMode: "broken", TargetClasses: map[string]bool{"ingress": true}})
 	if policy.TLSProbeMode != "handshake-only" {
 		t.Fatalf("expected fallback tls probe mode, got %+v", policy)
