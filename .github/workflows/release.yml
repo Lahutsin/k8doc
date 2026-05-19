@@ -1,0 +1,108 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Require tag ref for manual release runs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "Manual release runs must be started from a tag ref, for example v0.1.0." >&2
+            exit 1
+          fi
+
+      - name: Run full tests
+        run: go test ./...
+
+      - name: Verify output contract
+        run: go test ./cmd/k8doc -run TestPublishedOutputContract -count=1
+
+      - name: Verify runtime guardrails
+        run: go test ./internal/diagnostics -run 'Test(PagedListRespectsChunkingAndContinue|PagedListMemoryGuardrail|WithRetryRetriesTransientFailures|ListPodsCachedReusesAPIResult|CollectCapabilityPreflightPartial|RuntimeRoundTripperRetriesAndLimits|TransientErrorClassification|IssuePolicy)' -count=1
+
+      - name: Build release archives
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          for target in \
+            "linux amd64" \
+            "linux arm64" \
+            "darwin amd64" \
+            "darwin arm64" \
+            "windows amd64"; do
+            set -- $target
+            GOOS="$1"
+            GOARCH="$2"
+            BIN_NAME="k8doc"
+            ARCHIVE_NAME="k8doc_${VERSION}_${GOOS}_${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              BIN_NAME="${BIN_NAME}.exe"
+            fi
+
+            BUILD_DIR="dist/${ARCHIVE_NAME}"
+            mkdir -p "$BUILD_DIR"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags='-s -w' -o "$BUILD_DIR/$BIN_NAME" ./cmd/k8doc
+            cp README.md LICENSE "$BUILD_DIR/"
+
+            if [ "$GOOS" = "windows" ]; then
+              (cd dist && zip -rq "${ARCHIVE_NAME}.zip" "$ARCHIVE_NAME")
+            else
+              tar -C dist -czf "dist/${ARCHIVE_NAME}.tar.gz" "$ARCHIVE_NAME"
+            fi
+
+            rm -rf "$BUILD_DIR"
+          done
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          shasum -a 256 *.tar.gz *.zip > checksums.txt
+
+      - name: Upload release bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundles-${{ github.ref_name }}
+          path: dist/*
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundles-${{ github.ref_name }}
+          path: dist
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          prerelease_args=""
+          case "$VERSION" in
+            *-alpha*|*-beta*|*-rc*)
+              prerelease_args="--prerelease"
+              ;;
+          esac
+
+          gh release create "$VERSION" dist/* \
+            --generate-notes \
+            --title "$VERSION" \
+            $prerelease_args
